@@ -1,591 +1,698 @@
-"""Career Finder Marrakech - interface Streamlit (remplace FastAPI + frontend/static)."""
-import io
+"""Career Finder - Recherche de stage à Marrakech (IA & IT) - version Streamlit."""
+import hashlib
 import os
-import re
-import sys
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+import sqlite3
+import datetime as dt
 
 import pandas as pd
+import requests
 import streamlit as st
 
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+st.set_page_config(page_title="Career Finder", page_icon="🎯", layout="wide")
 
-st.set_page_config(page_title="Career Finder Marrakech", page_icon="🎯", layout="wide")
+DB = "career_finder.db"
+SECTORS = ["Informatique", "IA", "Marketing", "Commerce", "Autre"]
+STATUSES = ["À contacter", "Envoyée", "Entretien", "Offre reçue", "Refusée"]
+CONTRACTS = ["Stage", "CDI", "CDD", "Freelance", "Alternance"]
+INTERN_TYPES = ["PFE", "Stage d'initiation", "Stage d'été", "Stage technique"]
+MAX_CV = 10
+MAX_CV_BYTES = 5 * 1024 * 1024
 
-# --- Secrets Streamlit -> variables d'environnement (AVANT d'importer backend.security) ---
-try:
-    for _k, _v in st.secrets.items():
-        if isinstance(_v, (str, int, float, bool)):
-            os.environ.setdefault(_k, str(_v))
-except Exception:
-    pass
-
-from dotenv import load_dotenv  # noqa: E402
-
-load_dotenv()
-
-from backend.database import (  # noqa: E402
-    CONTRATS, MAX_CVS_PER_USER, TYPES_STAGE, add_cv, count_emails_since, create_user,
-    delete_cv, delete_offer, delete_opportunity, get_connection, get_cv, get_opportunities_for_user,
-    get_offer_owner, get_opportunity, get_opportunity_owner, get_profile, get_user, init_db,
-    insert_manual_opportunity, insert_offer, last_email_to, list_cvs, list_offers, log_email,
-    toggle_favorite, update_cv, update_opportunity_fields, upsert_offers, upsert_opportunities,
-    upsert_profile,
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 2rem;}
+div[data-testid="stSidebar"] {border-right: 1px solid #1f2a44;}
+.badge {background:#0f766e; color:#d1fae5; padding:2px 10px; border-radius:12px; font-size:.8rem;}
+.muted {color:#8b9ab8; font-size:.9rem;}
+</style>
+""",
+    unsafe_allow_html=True,
 )
-from backend.mailer import (  # noqa: E402
-    MAX_CV_BYTES, MailError, build_cv_message, is_valid_email, safe_filename, send_message,
-    smtp_configured,
-)
-from backend.security import LoginRateLimiter, hash_password, verify_password  # noqa: E402
-from pipeline.cleaner import clean_and_score_places  # noqa: E402
-from pipeline.excel_importer import clean_excel_opportunities  # noqa: E402
-from pipeline.google_places import fetch_it_companies_google  # noqa: E402
-from pipeline.sectors import SECTEURS  # noqa: E402
 
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
-MIN_PASSWORD_LENGTH = 8
-STATUTS = ["À contacter", "Envoyée", "Entretien", "Offre reçue", "Refusée"]
-MAX_CV_PER_HOUR = int(os.getenv("MAX_CV_PER_HOUR", "10"))
-MAX_CV_PER_DAY = int(os.getenv("MAX_CV_PER_DAY", "30"))
-CV_RESEND_DELAY_DAYS = 7
-GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+# ----------------------------------------------------------------- Base de données
 
 
-@st.cache_resource
-def _setup():
-    init_db()
-    return LoginRateLimiter(max_attempts=5, window=300)
+def get_conn():
+    c = sqlite3.connect(DB, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
 
-limiter = _setup()
+def q(sql, params=()):
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(sql, params).fetchall()]
 
 
-# ---------------------------------------------------------------- utilitaires
-def user_applications(username: str) -> pd.DataFrame:
-    conn = get_connection()
-    df = pd.read_sql_query(
-        "SELECT * FROM applications WHERE user=? ORDER BY date_ajout DESC", conn, params=(username,))
-    conn.close()
-    return df
+def ex(sql, params=()):
+    with get_conn() as c:
+        cur = c.execute(sql, params)
+        c.commit()
+        return cur.lastrowid
 
 
-def compute_match_score(profile_skills, mots_cles, score_opportunite) -> float:
-    a = {s.strip().lower() for s in (profile_skills or "").split(",") if s.strip()}
-    b = {s.strip().lower() for s in (mots_cles or "").split(",") if s.strip()}
-    kw = round(100 * len(a & b) / len(a), 1) if a and b else 0.0
-    return min(round(0.6 * kw + 0.4 * (score_opportunite or 0), 1), 100.0)
+def init_db():
+    with get_conn() as c:
+        c.executescript(
+            """
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY, username TEXT UNIQUE, salt TEXT, pwd TEXT, role TEXT);
+        CREATE TABLE IF NOT EXISTS companies(
+            id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, address TEXT, sector TEXT,
+            phone TEXT, email TEXT, website TEXT, maps TEXT, rating REAL,
+            lat REAL, lng REAL, favorite INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS offers(
+            id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, company TEXT,
+            intern_type TEXT, contract TEXT, link TEXT, created TEXT);
+        CREATE TABLE IF NOT EXISTS applications(
+            id INTEGER PRIMARY KEY, user_id INTEGER, company TEXT, position TEXT,
+            date TEXT, status TEXT, comment TEXT);
+        CREATE TABLE IF NOT EXISTS cvs(
+            id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, filename TEXT,
+            data BLOB, size INTEGER, is_default INTEGER DEFAULT 0, created TEXT);
+        CREATE TABLE IF NOT EXISTS profiles(
+            user_id INTEGER PRIMARY KEY, skills TEXT, sectors TEXT, keywords TEXT, level TEXT);
+        """
+        )
 
 
-def run_sql(sql: str, params=()):
-    conn = get_connection()
-    conn.execute(sql, params)
-    conn.commit()
-    conn.close()
+init_db()
+
+# ----------------------------------------------------------------- Authentification
 
 
-def df_to_xlsx(sheets: dict) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        for name, d in sheets.items():
-            d.to_excel(w, sheet_name=name[:31], index=False)
-    return buf.getvalue()
+def hash_pwd(pwd, salt):
+    return hashlib.pbkdf2_hmac("sha256", pwd.encode(), salt.encode(), 100_000).hex()
 
 
-# ---------------------------------------------------------------- authentification
-def login_screen():
-    st.title("🎯 Career Finder")
+def register(username, pwd):
+    if len(username) < 3 or len(pwd) < 6:
+        return "Pseudo ≥ 3 caractères et mot de passe ≥ 6 caractères."
+    if q("SELECT id FROM users WHERE username=?", (username,)):
+        return "Ce pseudo existe déjà."
+    role = "admin" if not q("SELECT id FROM users LIMIT 1") else "user"
+    salt = os.urandom(8).hex()
+    ex("INSERT INTO users(username,salt,pwd,role) VALUES(?,?,?,?)",
+       (username, salt, hash_pwd(pwd, salt), role))
+    return None
+
+
+def login(username, pwd):
+    u = q("SELECT * FROM users WHERE username=?", (username,))
+    if u and u[0]["pwd"] == hash_pwd(pwd, u[0]["salt"]):
+        st.session_state.user = u[0]
+        return True
+    return False
+
+
+def auth_screen():
+    st.markdown("## 🎯 Career Finder")
     st.caption("Marrakech · IA & IT")
-    tab_in, tab_up = st.tabs(["Connexion", "Inscription"])
-
-    with tab_in:
+    t1, t2 = st.tabs(["Connexion", "Créer un compte"])
+    with t1:
         with st.form("login"):
-            u = st.text_input("Nom d'utilisateur").strip()
+            u = st.text_input("Pseudo")
             p = st.text_input("Mot de passe", type="password")
-            ok = st.form_submit_button("Se connecter", type="primary")
-        if ok:
-            key = u.lower()
-            if limiter.is_blocked(key):
-                st.error("Trop de tentatives. Réessaie dans quelques minutes.")
-            else:
-                user = get_user(u)
-                stored = user["password_hash"] if user else "scrypt$AAAA$AAAA"
-                if not verify_password(p, stored) or user is None:
-                    limiter.register_failure(key)
-                    st.error("Identifiants incorrects.")
+            if st.form_submit_button("Se connecter", type="primary"):
+                if login(u.strip(), p):
+                    st.rerun()
                 else:
-                    limiter.reset(key)
-                    st.session_state.user = {"username": user["username"], "is_admin": bool(user["is_admin"])}
-                    st.rerun()
-
-    with tab_up:
+                    st.error("Identifiants incorrects.")
+    with t2:
         with st.form("register"):
-            u = st.text_input("Nom d'utilisateur (3-32 caractères)", key="ru").strip()
-            p = st.text_input("Mot de passe (8 caractères min.)", type="password", key="rp")
-            ok = st.form_submit_button("Créer mon compte")
-        if ok:
-            if not USERNAME_RE.match(u):
-                st.error("Nom d'utilisateur : 3 à 32 caractères (lettres, chiffres, . _ -).")
-            elif len(p) < MIN_PASSWORD_LENGTH:
-                st.error(f"Mot de passe : {MIN_PASSWORD_LENGTH} caractères minimum.")
-            else:
-                try:
-                    user = create_user(u, hash_password(p))
-                    st.session_state.user = {"username": user["username"], "is_admin": user["is_admin"]}
+            u = st.text_input("Pseudo", key="ru")
+            p = st.text_input("Mot de passe", type="password", key="rp")
+            if st.form_submit_button("Créer mon compte"):
+                err = register(u.strip(), p)
+                if err:
+                    st.error(err)
+                else:
+                    login(u.strip(), p)
                     st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
 
 
 if "user" not in st.session_state:
-    login_screen()
+    auth_screen()
     st.stop()
 
-ME = st.session_state.user["username"]
-IS_ADMIN = st.session_state.user["is_admin"]
+USER = st.session_state.user
+UID = USER["id"]
 
-# ---------------------------------------------------------------- navigation
-PAGES = ["🏠 Accueil", "🏢 Entreprises", "📄 Offres", "🗺️ Carte", "📨 Candidatures",
-         "📎 Mes CV", "👤 Profil & Matching", "📊 Statistiques", "🗄️ Collecte & Import"]
+# ----------------------------------------------------------------- Helpers métier
+
+
+def get_profile():
+    r = q("SELECT * FROM profiles WHERE user_id=?", (UID,))
+    if r:
+        return r[0]
+    return {"skills": "", "sectors": "", "keywords": "", "level": ""}
+
+
+def compute_score(c, profile):
+    """Score d'opportunité (0-100) d'une entreprise."""
+    s = min((c.get("rating") or 0) / 5, 1) * 40
+    s += 20 if c.get("website") else 0
+    s += 15 if c.get("email") else 0
+    s += 10 if c.get("phone") else 0
+    kws = [k.strip().lower() for k in (profile.get("keywords") or "").split(",") if k.strip()]
+    kws += [k.strip().lower() for k in (profile.get("skills") or "").split(",") if k.strip()]
+    text = f"{c.get('name','')} {c.get('address','')} {c.get('sector','')}".lower()
+    if any(k in text for k in kws):
+        s += 15
+    return int(min(100, round(s)))
+
+
+def companies_df():
+    rows = q("SELECT * FROM companies WHERE user_id=?", (UID,))
+    prof = get_profile()
+    for r in rows:
+        r["score"] = compute_score(r, prof)
+    df = pd.DataFrame(rows)
+    return df.sort_values("score", ascending=False) if not df.empty else df
+
+
+def default_cv():
+    r = q("SELECT * FROM cvs WHERE user_id=? ORDER BY is_default DESC, id LIMIT 1", (UID,))
+    return r[0] if r else None
+
+
+def add_application(company, position="Stage", status="À contacter", comment=""):
+    ex("INSERT INTO applications(user_id,company,position,date,status,comment) VALUES(?,?,?,?,?,?)",
+       (UID, company, position, dt.date.today().isoformat(), status, comment))
+
+
+# ----------------------------------------------------------------- Navigation
+
+PAGES = {
+    "🏠 Accueil": "home",
+    "🏢 Entreprises": "companies",
+    "📄 Offres": "offers",
+    "🗺️ Carte": "map",
+    "📨 Candidatures": "apps",
+    "📎 Mes CV": "cvs",
+    "👤 Profil & Matching": "profile",
+    "📊 Statistiques": "stats",
+    "🗄️ Collecte & Import": "import",
+}
 
 with st.sidebar:
-    st.header("🎯 Career Finder")
+    st.markdown("### 🎯 Career Finder")
     st.caption("Marrakech · IA & IT")
-    page = st.radio("Navigation", PAGES, label_visibility="collapsed")
+    if "page" not in st.session_state:
+        st.session_state.page = "🏠 Accueil"
+    page = st.radio("Navigation", list(PAGES), key="page", label_visibility="collapsed")
     st.divider()
-    st.write(f"**{ME}**" + (" · admin" if IS_ADMIN else ""))
+    st.markdown(f"**{USER['username']}** · `{USER['role']}`")
     if st.button("Se déconnecter", use_container_width=True):
-        st.session_state.clear()
+        del st.session_state["user"]
         st.rerun()
 
 
-# ---------------------------------------------------------------- Accueil
-def page_accueil():
-    st.title(f"Bonjour {ME} 👋")
+def goto(p):
+    st.session_state.page = p
+
+
+# ----------------------------------------------------------------- Pages
+
+
+def page_home():
+    st.title(f"Bonjour {USER['username']} 👋")
     st.caption("Voici où en est ta recherche de stage à Marrakech.")
-    opps = get_opportunities_for_user(ME)
-    apps = user_applications(ME)
-    offers = list_offers()
-    prof = get_profile(ME)
-    n = len(opps)
-    n_mail = int((opps["email"].fillna("").str.strip() != "").sum()) if n else 0
-    n_cv_sent = int(opps["cv_envoye_le"].notna().sum()) if n else 0
+    df = companies_df()
+    n_comp = len(df)
+    n_mail = int(df["email"].fillna("").ne("").sum()) if n_comp else 0
+    n_off = q("SELECT COUNT(*) n FROM offers WHERE user_id=?", (UID,))[0]["n"]
+    apps = q("SELECT * FROM applications WHERE user_id=?", (UID,))
+    n_sent = sum(1 for a in apps if a["status"] != "À contacter")
+    prof = get_profile()
 
     steps = [
-        ("Enregistre ton CV (PDF)", len(list_cvs(ME)) > 0),
-        ("Renseigne tes compétences", bool((prof.get("skills") or "").strip())),
-        ("Récupère des entreprises (Google Places ou Excel)", n > 0),
-        ("Ajoute des e-mails de contact", n_mail > 0),
-        ("Envoie ton premier CV", n_cv_sent > 0),
+        ("Enregistre ton CV (PDF)", default_cv() is not None, "📎 Mes CV", "Ajouter"),
+        ("Renseigne tes compétences", bool(prof["skills"]), "👤 Profil & Matching", "Profil"),
+        ("Récupère des entreprises (Google Places ou Excel)", n_comp > 0, "🗄️ Collecte & Import", "Importer"),
+        ("Ajoute des e-mails de contact", n_mail > 0, "🏢 Entreprises", "Voir les entreprises"),
+        ("Envoie ton premier CV", n_sent > 0, "📨 Candidatures", "Postuler"),
     ]
-    done = sum(1 for _, ok in steps if ok)
-    st.subheader(f"🚀 Pour bien démarrer · {done}/5")
-    st.progress(done / 5)
-    for label, ok in steps:
-        st.write(("✅ ~~" + label + "~~") if ok else ("⬜ " + label))
+    done = sum(1 for s in steps if s[1])
+    with st.container(border=True):
+        st.subheader(f"🚀 Pour bien démarrer · {done}/5")
+        st.progress(done / 5)
+        for i, (label, ok, target, btn) in enumerate(steps, 1):
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(f"{'✅' if ok else f'**{i}.**'} " + (f"~~{label}~~" if ok else label))
+            if not ok:
+                c2.button(btn, key=f"step{i}", on_click=goto, args=(target,))
 
-    c = st.columns(5)
-    c[0].metric("Entreprises", n)
-    c[1].metric("Offres", len(offers))
-    c[2].metric("Avec e-mail", n_mail)
-    c[3].metric("CV envoyés", n_cv_sent)
-    c[4].metric("Candidatures", len(apps))
-
-
-# ---------------------------------------------------------------- Envoi de CV
-def send_cv_ui(opp: dict):
-    st.markdown("##### ✉️ Envoyer mon CV")
-    if not smtp_configured():
-        st.info("L'envoi d'e-mails n'est pas configuré (secrets SMTP_HOST et SMTP_FROM manquants).")
-        return
-    to_email = (opp.get("email") or "").strip()
-    if not is_valid_email(to_email):
-        st.warning("Cette entreprise n'a pas d'adresse e-mail valide. Ajoute-la ci-dessus.")
-        return
-    cvs = list_cvs(ME)
-    if not cvs:
-        st.warning("Enregistre d'abord un CV dans « Mes CV ».")
-        return
-    with st.form(f"sendcv_{opp['id']}"):
-        cv_choice = st.selectbox("CV à envoyer", cvs, format_func=lambda c: c["label"] + (" (défaut)" if c["is_default"] else ""))
-        subject = st.text_input("Objet", f"Candidature spontanée pour un stage - {opp['nom']}")
-        message = st.text_area("Message", f"Bonjour,\n\nJe vous adresse ma candidature spontanée pour un stage au sein de {opp['nom']}.\nVous trouverez mon CV en pièce jointe.\n\nCordialement,\n{ME}", height=180)
-        reply_to = st.text_input("Ton e-mail (réponse)")
-        force = st.checkbox("Renvoyer même si déjà envoyé récemment")
-        go = st.form_submit_button("Envoyer", type="primary")
-    if not go:
-        return
-    if not subject.strip() or not message.strip():
-        st.error("L'objet et le message sont obligatoires.")
-        return
-    if reply_to.strip() and not is_valid_email(reply_to.strip()):
-        st.error("Ton adresse de réponse est invalide.")
-        return
-    if count_emails_since(ME, 1) >= MAX_CV_PER_HOUR or count_emails_since(ME, 24) >= MAX_CV_PER_DAY:
-        st.error("Limite d'envois atteinte. Réessaie plus tard.")
-        return
-    prev = last_email_to(ME, opp["id"])
-    if prev and not force:
-        sent_at = datetime.strptime(prev, "%Y-%m-%d %H:%M:%S")
-        if datetime.now(timezone.utc).replace(tzinfo=None) - sent_at < timedelta(days=CV_RESEND_DELAY_DAYS):
-            st.error(f"Tu as déjà envoyé ton CV le {sent_at:%d/%m/%Y}. Coche « Renvoyer » pour confirmer.")
-            return
-    saved = get_cv(ME, cv_choice["id"], with_content=True)
-    msg = build_cv_message(to_email=to_email, subject=subject.strip(), body=message.strip(),
-                           cv_bytes=saved["content"], cv_filename=saved["filename"], reply_to=reply_to.strip())
-    try:
-        send_message(msg)
-    except MailError as e:
-        st.error(str(e))
-        return
-    log_email(ME, opp["id"], to_email, subject.strip())
-    run_sql("""INSERT INTO applications (user, company, poste, statut, date_candidature, remarque, opportunity_id)
-               VALUES (?, ?, 'Candidature spontanée', 'Envoyée', ?, ?, ?)""",
-            (ME, opp["nom"], date.today().isoformat(), f"CV « {saved['label']} » envoyé à {to_email}", opp["id"]))
-    st.success(f"CV envoyé à {to_email} ✅")
+    k = st.columns(5)
+    k[0].metric("🏢 Entreprises", n_comp)
+    k[1].metric("📄 Offres", n_off)
+    k[2].metric("✉️ Avec e-mail", n_mail)
+    k[3].metric("📤 CV envoyés", n_sent)
+    k[4].metric("📨 Candidatures", len(apps))
 
 
-# ---------------------------------------------------------------- Entreprises
-def page_entreprises():
+def company_form(prefix, c=None):
+    c = c or {}
+    col1, col2 = st.columns(2)
+    name = col1.text_input("Nom", c.get("name", ""), key=f"{prefix}n")
+    sector = col2.selectbox("Secteur", SECTORS,
+                            index=SECTORS.index(c["sector"]) if c.get("sector") in SECTORS else 0, key=f"{prefix}s")
+    address = st.text_input("Adresse", c.get("address", "") or "", key=f"{prefix}a")
+    col3, col4, col5 = st.columns(3)
+    phone = col3.text_input("Téléphone", c.get("phone", "") or "", key=f"{prefix}p")
+    email = col4.text_input("E-mail", c.get("email", "") or "", key=f"{prefix}e")
+    website = col5.text_input("Site web", c.get("website", "") or "", key=f"{prefix}w")
+    return dict(name=name, sector=sector, address=address, phone=phone, email=email, website=website)
+
+
+def page_companies():
     st.title("🏢 Entreprises")
-    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
-    q = c1.text_input("Recherche (nom, mots-clés)")
-    secteurs = c2.multiselect("Secteur", SECTEURS)
-    min_score = c3.number_input("Score min", 0, 100, 0)
-    fav_only = c4.checkbox("Favoris")
-    df = get_opportunities_for_user(ME, int(min_score), fav_only)
-    if q:
-        mask = df["nom"].fillna("").str.contains(q, case=False) | df["mots_cles"].fillna("").str.contains(q, case=False)
-        df = df[mask]
-    if secteurs:
-        df = df[df["secteur"].isin(secteurs)]
+    st.caption("Entreprises IA & IT de Marrakech, classées par score d'opportunité.")
+    df = companies_df()
 
-    st.caption(f"{len(df)} entreprise(s)")
-    show = df[["nom", "secteur", "score_opportunite", "note", "email", "telephone", "site_web", "favori", "cv_envoye_le"]]
-    st.dataframe(show, use_container_width=True, hide_index=True)
-    st.download_button("⬇️ Export CSV", df.to_csv(index=False).encode("utf-8-sig"), "opportunites.csv", "text/csv")
+    with st.container(border=True):
+        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 1, 1])
+        search = c1.text_input("Recherche", placeholder="Nom ou adresse…")
+        sector = c2.selectbox("Secteur", ["Tous les secteurs"] + SECTORS)
+        min_score = c3.slider("Score minimum", 0, 100, 0)
+        only_mail = c4.checkbox("Avec e-mail")
+        only_fav = c5.checkbox("Favoris")
 
-    if df.empty:
-        return
-    st.divider()
-    rows = df.to_dict("records")
-    opp = st.selectbox("Choisir une entreprise", rows, format_func=lambda r: f"{r['nom']} ({r['score_opportunite']})")
-    st.subheader(opp["nom"])
-    st.write(f"📍 {opp.get('adresse') or '—'}  ·  Secteur : {opp.get('secteur')}  ·  Score : {opp.get('score_opportunite')}")
-    if opp.get("google_maps_url"):
-        st.link_button("Ouvrir dans Google Maps", opp["google_maps_url"])
-
-    cols = st.columns(2)
-    if cols[0].button("★ Retirer des favoris" if opp["favori"] else "☆ Ajouter aux favoris", key=f"fav{opp['id']}"):
-        toggle_favorite(ME, opp["id"])
-        st.rerun()
-    can_edit = IS_ADMIN or opp.get("added_by") == ME
-    if can_edit and cols[1].button("🗑️ Supprimer", key=f"del{opp['id']}"):
-        delete_opportunity(opp["id"])
-        st.rerun()
-
-    if can_edit:
-        with st.form(f"edit{opp['id']}"):
-            e = st.text_input("E-mail", opp.get("email") or "")
-            t = st.text_input("Téléphone", opp.get("telephone") or "")
-            w = st.text_input("Site web", opp.get("site_web") or "")
-            s = st.selectbox("Secteur", SECTEURS, index=SECTEURS.index(opp["secteur"]) if opp.get("secteur") in SECTEURS else 0)
-            if st.form_submit_button("Enregistrer"):
-                e = e.strip().lower()
-                if e and not is_valid_email(e):
-                    st.error("Adresse e-mail invalide")
-                else:
-                    update_opportunity_fields(opp["id"], {"email": e, "telephone": t, "site_web": w, "secteur": s})
-                    st.success("Enregistré")
-                    st.rerun()
-    send_cv_ui(get_opportunity(opp["id"]))
-
-    with st.expander("➕ Ajouter une entreprise manuellement"):
-        with st.form("manual_opp"):
-            nom = st.text_input("Nom *")
-            email = st.text_input("E-mail")
-            sect = st.selectbox("Secteur", SECTEURS, key="msect")
-            adr = st.text_input("Adresse")
-            tel = st.text_input("Téléphone")
-            site = st.text_input("Site web")
-            if st.form_submit_button("Ajouter"):
-                if not nom.strip():
-                    st.error("Le nom est obligatoire")
-                elif email.strip() and not is_valid_email(email.strip()):
-                    st.error("E-mail invalide")
-                else:
-                    try:
-                        insert_manual_opportunity({"nom": nom.strip(), "email": email.strip().lower(), "secteur": sect,
-                                                   "adresse": adr, "telephone": tel, "site_web": site}, added_by=ME)
-                        st.success("Entreprise ajoutée")
-                        st.rerun()
-                    except ValueError as err:
-                        st.error(str(err))
-
-
-# ---------------------------------------------------------------- Offres
-def page_offres():
-    st.title("📄 Offres de stage / d'emploi")
-    c1, c2, c3 = st.columns(3)
-    q = c1.text_input("Recherche")
-    contrat = c2.selectbox("Contrat", [""] + CONTRATS)
-    tstage = c3.selectbox("Type de stage", [""] + TYPES_STAGE)
-    df = list_offers(q.strip(), contrat, tstage)
-    st.caption(f"{len(df)} offre(s)")
-    if not df.empty:
-        st.dataframe(df[["titre", "entreprise", "contrat", "type_stage", "ville", "date_publication", "url"]],
-                     use_container_width=True, hide_index=True,
-                     column_config={"url": st.column_config.LinkColumn("Lien")})
-        offer = st.selectbox("Supprimer une offre", df.to_dict("records"),
-                             format_func=lambda r: f"{r['titre']} - {r['entreprise']}")
-        if st.button("🗑️ Supprimer cette offre"):
-            exists, owner = get_offer_owner(offer["id"])
-            if IS_ADMIN or owner == ME:
-                delete_offer(offer["id"])
+    with st.expander("➕ Ajouter une entreprise"):
+        with st.form("add_company", clear_on_submit=True):
+            data = company_form("new")
+            if st.form_submit_button("Enregistrer", type="primary") and data["name"]:
+                ex("INSERT INTO companies(user_id,name,sector,address,phone,email,website) VALUES(?,?,?,?,?,?,?)",
+                   (UID, data["name"], data["sector"], data["address"], data["phone"], data["email"], data["website"]))
                 st.rerun()
-            else:
-                st.error("Tu ne peux supprimer que les offres que tu as ajoutées.")
 
-    with st.expander("➕ Ajouter une offre"):
-        with st.form("new_offer"):
-            titre = st.text_input("Titre *")
-            ent = st.text_input("Entreprise")
-            ct = st.selectbox("Contrat", CONTRATS, key="oc")
-            ts = st.selectbox("Type de stage", TYPES_STAGE, key="ot")
-            ville = st.text_input("Ville", "Marrakech")
-            pub = st.date_input("Date de publication", date.today())
-            url = st.text_input("Lien (http/https)")
-            desc = st.text_area("Description")
-            if st.form_submit_button("Ajouter"):
-                if url.strip() and not re.match(r"^https?://", url.strip(), re.I):
-                    st.error("Le lien doit commencer par http:// ou https://")
-                else:
-                    try:
-                        insert_offer({"titre": titre, "entreprise": ent, "contrat": ct, "type_stage": ts, "ville": ville,
-                                      "date_publication": pub.isoformat(), "url": url, "description": desc}, added_by=ME)
-                        st.success("Offre ajoutée")
-                        st.rerun()
-                    except ValueError as err:
-                        st.error(str(err))
-
-    with st.expander("📥 Importer des offres (CSV / Excel)"):
-        up = st.file_uploader("Fichier", type=["csv", "xlsx"], key="offers_up")
-        if up and st.button("Importer"):
-            try:
-                raw = pd.read_csv(up, sep=None, engine="python", encoding="utf-8-sig") if up.name.lower().endswith(".csv") else pd.read_excel(up)
-            except Exception as e:
-                st.error(f"Fichier illisible : {e}")
-                return
-            lower = {str(c).strip().lower(): c for c in raw.columns}
-            pick = lambda *names: next((lower[n] for n in names if n in lower), None)  # noqa: E731
-            ctitre = pick("titre", "title", "intitulé", "intitule", "poste")
-            if ctitre is None:
-                st.error("Colonne du titre introuvable (titre, intitulé ou poste).")
-                return
-            m = {"entreprise": pick("entreprise", "company", "société", "societe"), "contrat": pick("contrat", "contract"),
-                 "type_stage": pick("type_stage", "type de stage"), "ville": pick("ville", "city"),
-                 "date_publication": pick("date_publication", "date"), "url": pick("url", "lien", "link"),
-                 "description": pick("description")}
-            rows = []
-            for _, r in raw.iterrows():
-                d = {"titre": str(r[ctitre]).strip(), "source": "Import fichier"}
-                for k, c in m.items():
-                    d[k] = "" if c is None or pd.isna(r[c]) else str(r[c]).strip()
-                rows.append(d)
-            rep = upsert_offers(rows, added_by=ME)
-            st.success(f"{rep['ajoutees']} ajoutée(s), {rep['ignorees']} ignorée(s)")
-
-
-# ---------------------------------------------------------------- Carte
-def page_carte():
-    st.title("🗺️ Carte")
-    df = get_opportunities_for_user(ME)
-    geo = df.dropna(subset=["latitude", "longitude"])[["latitude", "longitude"]]
-    if geo.empty:
-        st.info("Aucune entreprise géolocalisée.")
-    else:
-        st.map(geo)
-        st.caption(f"{len(geo)} entreprise(s) affichée(s)")
-
-
-# ---------------------------------------------------------------- Candidatures
-def page_candidatures():
-    st.title("📨 Candidatures")
-    apps = user_applications(ME)
-    if apps.empty:
-        st.info("Aucune candidature pour le moment.")
-    else:
-        st.dataframe(apps[["id", "company", "poste", "statut", "date_candidature", "remarque"]],
-                     use_container_width=True, hide_index=True)
-        st.subheader("Modifier / supprimer")
-        a = st.selectbox("Candidature", apps.to_dict("records"), format_func=lambda r: f"#{r['id']} · {r['company']} · {r['poste']}")
-        c1, c2 = st.columns(2)
-        new_st = c1.selectbox("Statut", STATUTS, index=STATUTS.index(a["statut"]) if a["statut"] in STATUTS else 0)
-        rem = c2.text_input("Remarque", a.get("remarque") or "")
-        b1, b2 = st.columns(2)
-        if b1.button("Enregistrer", type="primary"):
-            run_sql("UPDATE applications SET statut=?, remarque=? WHERE id=? AND user=?", (new_st, rem, a["id"], ME))
-            st.rerun()
-        if b2.button("🗑️ Supprimer"):
-            run_sql("DELETE FROM applications WHERE id=? AND user=?", (a["id"], ME))
-            st.rerun()
-
-    with st.expander("➕ Nouvelle candidature"):
-        with st.form("new_app"):
-            company = st.text_input("Entreprise *")
-            poste = st.text_input("Poste *")
-            statut = st.selectbox("Statut", STATUTS)
-            d = st.date_input("Date", date.today())
-            rem = st.text_input("Remarque")
-            if st.form_submit_button("Enregistrer"):
-                if company.strip() and poste.strip():
-                    run_sql("""INSERT INTO applications (user, company, poste, statut, date_candidature, remarque)
-                               VALUES (?, ?, ?, ?, ?, ?)""", (ME, company.strip(), poste.strip(), statut, d.isoformat(), rem))
-                    st.rerun()
-                else:
-                    st.error("Entreprise et poste obligatoires")
-
-
-# ---------------------------------------------------------------- Mes CV
-def page_cv():
-    st.title("📎 Mes CV")
-    cvs = list_cvs(ME)
-    st.caption(f"{len(cvs)}/{MAX_CVS_PER_USER} CV enregistrés")
-    for cv in cvs:
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-        c1.write(f"**{cv['label']}** {'⭐ (défaut)' if cv['is_default'] else ''}  \n{cv['filename']} · {cv['size_bytes'] // 1024} Ko")
-        full = get_cv(ME, cv["id"], with_content=True)
-        c2.download_button("Télécharger", full["content"], safe_filename(cv["filename"]), "application/pdf", key=f"dl{cv['id']}")
-        if not cv["is_default"] and c3.button("Par défaut", key=f"def{cv['id']}"):
-            update_cv(ME, cv["id"], make_default=True)
-            st.rerun()
-        if c4.button("🗑️", key=f"rm{cv['id']}"):
-            delete_cv(ME, cv["id"])
-            st.rerun()
-    st.divider()
-    with st.form("add_cv", clear_on_submit=True):
-        label = st.text_input("Nom du CV (ex. « CV IA »)", max_chars=60)
-        f = st.file_uploader("Fichier PDF (5 Mo max)", type=["pdf"])
-        make_def = st.checkbox("Définir comme CV par défaut")
-        if st.form_submit_button("Enregistrer", type="primary"):
-            data = f.getvalue() if f else b""
-            if not label.strip():
-                st.error("Donne un nom à ce CV.")
-            elif not data.startswith(b"%PDF"):
-                st.error("Le CV doit être un PDF valide.")
-            elif len(data) > MAX_CV_BYTES:
-                st.error("CV trop volumineux (5 Mo maximum).")
-            else:
-                try:
-                    add_cv(ME, re.sub(r"\s+", " ", label).strip(), safe_filename(f.name), data, make_def)
-                    st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
-
-
-# ---------------------------------------------------------------- Profil & Matching
-def page_profil():
-    st.title("👤 Profil & Matching")
-    prof = get_profile(ME)
-    with st.form("profile"):
-        skills = st.text_input("Compétences (séparées par des virgules)", prof.get("skills") or "",
-                               placeholder="python, machine learning, sql")
-        exp = st.number_input("Années d'expérience", 0.0, 50.0, float(prof.get("experience_years") or 0.0), 0.5)
-        bio = st.text_area("Bio", prof.get("bio") or "")
-        if st.form_submit_button("Enregistrer", type="primary"):
-            upsert_profile({"user": ME, "skills": skills, "experience_years": exp, "bio": bio,
-                            "cv_filename": prof.get("cv_filename", "")})
-            st.success("Profil enregistré")
-            st.rerun()
-
-    st.subheader("🎯 Entreprises qui te correspondent")
-    df = get_opportunities_for_user(ME)
     if df.empty:
-        st.info("Aucune entreprise dans la base.")
+        st.info("Aucune entreprise. Va dans « Collecte & Import » ou ajoute-en une.")
         return
-    df["match_score"] = df.apply(lambda r: compute_match_score(prof.get("skills", ""), r.get("mots_cles", ""), r.get("score_opportunite", 0)), axis=1)
-    mn = st.slider("Score de matching minimum", 0, 100, 0)
-    df = df[df["match_score"] >= mn].sort_values("match_score", ascending=False)
-    st.dataframe(df[["nom", "secteur", "match_score", "score_opportunite", "mots_cles", "email"]],
-                 use_container_width=True, hide_index=True)
+    f = df.copy()
+    if search:
+        s = search.lower()
+        f = f[f["name"].fillna("").str.lower().str.contains(s) | f["address"].fillna("").str.lower().str.contains(s)]
+    if sector != "Tous les secteurs":
+        f = f[f["sector"] == sector]
+    f = f[f["score"] >= min_score]
+    if only_mail:
+        f = f[f["email"].fillna("") != ""]
+    if only_fav:
+        f = f[f["favorite"] == 1]
+    st.write(f"**{len(f)}** entreprise(s) trouvée(s)")
+
+    per_page = 15
+    pages = max(1, -(-len(f) // per_page))
+    pg = st.number_input("Page", 1, pages, 1) if pages > 1 else 1
+    cv = default_cv()
+
+    for _, r in f.iloc[(pg - 1) * per_page: pg * per_page].iterrows():
+        with st.container(border=True):
+            a, b, c, d = st.columns([0.4, 4, 2, 3])
+            if a.button("⭐" if r["favorite"] else "☆", key=f"fav{r['id']}"):
+                ex("UPDATE companies SET favorite=? WHERE id=?", (0 if r["favorite"] else 1, int(r["id"])))
+                st.rerun()
+            b.markdown(f"**{r['name']}**")
+            if r["address"]:
+                b.markdown(f"<span class='muted'>{r['address']}</span>", unsafe_allow_html=True)
+            b.markdown(f"<span class='badge'>{r['sector']}</span>", unsafe_allow_html=True)
+            c.markdown(f"**Score {r['score']}**")
+            c.progress(r["score"] / 100)
+            if r["rating"]:
+                c.caption(f"⭐ {r['rating']}")
+            if r["phone"]:
+                c.caption(f"📞 {r['phone']}")
+            c.caption(f"✉️ {r['email']}" if r["email"] else "✉️ —")
+            links = []
+            if r["website"]:
+                links.append(f"[🌐 Site]({r['website']})")
+            if r["maps"]:
+                links.append(f"[📍 Maps]({r['maps']})")
+            d.markdown(" · ".join(links) if links else "—")
+            bc = d.columns(3)
+            if cv:
+                bc[0].download_button("CV", cv["data"], cv["filename"], "application/pdf", key=f"cv{r['id']}")
+            if bc[1].button("Suivre", key=f"fol{r['id']}"):
+                add_application(r["name"])
+                st.toast(f"{r['name']} ajoutée aux candidatures")
+            if bc[2].button("🗑️", key=f"del{r['id']}"):
+                ex("DELETE FROM companies WHERE id=?", (int(r["id"]),))
+                st.rerun()
+            with st.expander("✏️ Modifier"):
+                with st.form(f"edit{r['id']}"):
+                    data = company_form(f"e{r['id']}", r.to_dict())
+                    if st.form_submit_button("Mettre à jour"):
+                        ex("UPDATE companies SET name=?,sector=?,address=?,phone=?,email=?,website=? WHERE id=?",
+                           (*data.values(), int(r["id"])))
+                        st.rerun()
 
 
-# ---------------------------------------------------------------- Statistiques
+def page_offers():
+    st.title("📄 Offres de stage et d'emploi")
+    st.caption("Opportunités professionnelles à Marrakech.")
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        search = c1.text_input("Recherche", placeholder="Titre, entreprise…")
+        t = c2.selectbox("Type de stage", ["Tous les types"] + INTERN_TYPES)
+        ct = c3.selectbox("Contrat", ["Tous les contrats"] + CONTRACTS)
+    with st.expander("➕ Ajouter une offre"):
+        with st.form("add_offer", clear_on_submit=True):
+            a, b = st.columns(2)
+            title = a.text_input("Titre *")
+            company = b.text_input("Entreprise")
+            c, d = st.columns(2)
+            it = c.selectbox("Type de stage", INTERN_TYPES)
+            co = d.selectbox("Contrat", CONTRACTS)
+            link = st.text_input("Lien")
+            if st.form_submit_button("Enregistrer", type="primary") and title:
+                ex("INSERT INTO offers(user_id,title,company,intern_type,contract,link,created) VALUES(?,?,?,?,?,?,?)",
+                   (UID, title, company, it, co, link, dt.date.today().isoformat()))
+                st.rerun()
+    rows = q("SELECT * FROM offers WHERE user_id=? ORDER BY id DESC", (UID,))
+    if search:
+        rows = [r for r in rows if search.lower() in f"{r['title']} {r['company']}".lower()]
+    if t != "Tous les types":
+        rows = [r for r in rows if r["intern_type"] == t]
+    if ct != "Tous les contrats":
+        rows = [r for r in rows if r["contract"] == ct]
+    st.write(f"**{len(rows)}** offre(s) trouvée(s)")
+    if not rows:
+        st.info("Aucune offre. Ajoute-en une ou importe un fichier depuis « Collecte & Import ».")
+    for r in rows:
+        with st.container(border=True):
+            a, b = st.columns([6, 1])
+            a.markdown(f"**{r['title']}** — {r['company'] or '—'}")
+            a.markdown(f"<span class='badge'>{r['intern_type']}</span> <span class='badge'>{r['contract']}</span>",
+                       unsafe_allow_html=True)
+            if r["link"]:
+                a.markdown(f"[Voir l'offre]({r['link']})")
+            if b.button("🗑️", key=f"do{r['id']}"):
+                ex("DELETE FROM offers WHERE id=?", (r["id"],))
+                st.rerun()
+
+
+def page_map():
+    st.title("🗺️ Carte")
+    st.caption("Localisation des entreprises collectées.")
+    df = companies_df()
+    c1, c2 = st.columns([1, 2])
+    sector = c1.selectbox("Secteur", ["Tous les secteurs"] + SECTORS)
+    min_score = c2.slider("Score minimum", 0, 100, 0)
+    if df.empty:
+        st.info("Aucune entreprise collectée.")
+        return
+    f = df[df["score"] >= min_score]
+    if sector != "Tous les secteurs":
+        f = f[f["sector"] == sector]
+    f = f.dropna(subset=["lat", "lng"])
+    st.write(f"**{len(f)}** entreprise(s) affichée(s)")
+    if f.empty:
+        st.warning("Aucune coordonnée. Importe des données avec colonnes lat/lng ou utilise Google Places.")
+    else:
+        # Centre la carte sur Marrakech si possible
+        f = f[(f["lat"].between(-90, 90)) & (f["lng"].between(-180, 180))]
+        st.map(f.rename(columns={"lng": "lon"}), latitude="lat", longitude="lon", size=60)
+
+
+def page_apps():
+    st.title("📨 Suivi des candidatures")
+    st.caption("Ajoute et suis tes candidatures auprès des entreprises.")
+    with st.container(border=True):
+        with st.form("add_app", clear_on_submit=True):
+            st.subheader("➕ Ajouter une candidature")
+            a, b = st.columns(2)
+            company = a.text_input("Entreprise *", placeholder="Nom de l'entreprise")
+            position = b.text_input("Poste *", "Stage")
+            c, d = st.columns(2)
+            date = c.date_input("Date", dt.date.today())
+            status = d.selectbox("Statut", STATUSES)
+            comment = st.text_area("Commentaire", placeholder="Ex : CV envoyé par e-mail…")
+            if st.form_submit_button("💾 Enregistrer la candidature", type="primary") and company and position:
+                ex("INSERT INTO applications(user_id,company,position,date,status,comment) VALUES(?,?,?,?,?,?)",
+                   (UID, company, position, date.isoformat(), status, comment))
+                st.rerun()
+
+    apps = q("SELECT * FROM applications WHERE user_id=? ORDER BY id DESC", (UID,))
+    cols = st.columns(len(STATUSES))
+    for col, st_name in zip(cols, STATUSES):
+        items = [a for a in apps if a["status"] == st_name]
+        with col:
+            st.markdown(f"**{st_name.upper()}** `{len(items)}`")
+            for a in items:
+                with st.container(border=True):
+                    st.markdown(f"**{a['position']}**")
+                    st.caption(f"{a['company']} · {a['date']}")
+                    if a["comment"]:
+                        st.caption(a["comment"])
+                    new = st.selectbox("Statut", STATUSES, index=STATUSES.index(a["status"]),
+                                       key=f"st{a['id']}", label_visibility="collapsed")
+                    if new != a["status"]:
+                        ex("UPDATE applications SET status=? WHERE id=?", (new, a["id"]))
+                        st.rerun()
+                    if st.button("🗑️", key=f"da{a['id']}"):
+                        ex("DELETE FROM applications WHERE id=?", (a["id"],))
+                        st.rerun()
+
+
+def page_cvs():
+    st.title("📎 Mes CV")
+    cvs = q("SELECT id,name,filename,size,is_default,created FROM cvs WHERE user_id=? ORDER BY is_default DESC,id", (UID,))
+    st.caption(f"Enregistre tes CV (PDF) et choisis celui à envoyer à chaque entreprise. — **{len(cvs)} / {MAX_CV} CV**")
+    with st.container(border=True):
+        with st.form("add_cv", clear_on_submit=True):
+            st.subheader("➕ Ajouter un CV")
+            a, b = st.columns(2)
+            name = a.text_input("Nom du CV", placeholder="Ex. CV Intelligence Artificielle")
+            file = b.file_uploader("Fichier PDF (5 Mo maximum)", type=["pdf"])
+            default = st.checkbox("Utiliser comme CV par défaut")
+            if st.form_submit_button("Enregistrer le CV", type="primary"):
+                if len(cvs) >= MAX_CV:
+                    st.error("Limite de 10 CV atteinte.")
+                elif not name or not file:
+                    st.error("Nom et fichier requis.")
+                elif file.size > MAX_CV_BYTES:
+                    st.error("Fichier trop volumineux (5 Mo max).")
+                else:
+                    if default or not cvs:
+                        ex("UPDATE cvs SET is_default=0 WHERE user_id=?", (UID,))
+                        default = True
+                    ex("INSERT INTO cvs(user_id,name,filename,data,size,is_default,created) VALUES(?,?,?,?,?,?,?)",
+                       (UID, name, file.name, file.getvalue(), file.size, int(default), dt.date.today().isoformat()))
+                    st.rerun()
+
+    cols = st.columns(3)
+    for i, cv in enumerate(cvs):
+        with cols[i % 3]:
+            with st.container(border=True):
+                st.markdown(f"📕 **{cv['name']}**")
+                if cv["is_default"]:
+                    st.markdown("<span class='badge'>⭐ Par défaut</span>", unsafe_allow_html=True)
+                st.caption(f"{cv['filename']} · {cv['size']//1024} Ko · ajouté le {cv['created']}")
+                full = q("SELECT data FROM cvs WHERE id=?", (cv["id"],))[0]["data"]
+                st.download_button("⬇️ Télécharger", full, cv["filename"], "application/pdf", key=f"dl{cv['id']}")
+                new = st.text_input("Renommer", cv["name"], key=f"rn{cv['id']}", label_visibility="collapsed")
+                b1, b2, b3 = st.columns(3)
+                if b1.button("✏️", key=f"rb{cv['id']}", help="Renommer") and new:
+                    ex("UPDATE cvs SET name=? WHERE id=?", (new, cv["id"]))
+                    st.rerun()
+                if not cv["is_default"] and b2.button("⭐", key=f"df{cv['id']}", help="Par défaut"):
+                    ex("UPDATE cvs SET is_default=0 WHERE user_id=?", (UID,))
+                    ex("UPDATE cvs SET is_default=1 WHERE id=?", (cv["id"],))
+                    st.rerun()
+                if b3.button("🗑️", key=f"dc{cv['id']}"):
+                    ex("DELETE FROM cvs WHERE id=?", (cv["id"],))
+                    st.rerun()
+
+
+def page_profile():
+    st.title("👤 Profil & Matching")
+    st.caption("Renseigne tes compétences pour classer les entreprises selon ton profil.")
+    p = get_profile()
+    with st.form("profile"):
+        skills = st.text_input("Compétences (séparées par des virgules)", p["skills"] or "",
+                               placeholder="Python, Machine Learning, SQL, React…")
+        sectors = st.multiselect("Secteurs visés", SECTORS, [s for s in (p["sectors"] or "").split(",") if s in SECTORS])
+        keywords = st.text_input("Mots-clés d'entreprises", p["keywords"] or "", placeholder="IA, data, web, cloud…")
+        level = st.selectbox("Niveau", ["Bac+2", "Bac+3", "Bac+4", "Bac+5"],
+                             index=["Bac+2", "Bac+3", "Bac+4", "Bac+5"].index(p["level"]) if p["level"] in
+                             ["Bac+2", "Bac+3", "Bac+4", "Bac+5"] else 2)
+        if st.form_submit_button("💾 Enregistrer", type="primary"):
+            ex("INSERT OR REPLACE INTO profiles(user_id,skills,sectors,keywords,level) VALUES(?,?,?,?,?)",
+               (UID, skills, ",".join(sectors), keywords, level))
+            st.success("Profil enregistré.")
+            st.rerun()
+
+    st.subheader("🎯 Meilleures correspondances")
+    df = companies_df()
+    if df.empty:
+        st.info("Aucune entreprise à classer.")
+        return
+    prof = get_profile()
+    pref = [s for s in (prof["sectors"] or "").split(",") if s]
+    df = df.copy()
+    df["match"] = df.apply(lambda r: min(100, r["score"] + (10 if r["sector"] in pref else 0)), axis=1)
+    top = df.sort_values("match", ascending=False).head(20)
+    st.dataframe(top[["name", "sector", "address", "email", "match"]].rename(
+        columns={"name": "Entreprise", "sector": "Secteur", "address": "Adresse", "email": "E-mail", "match": "Match"}),
+        use_container_width=True, hide_index=True,
+        column_config={"Match": st.column_config.ProgressColumn("Match", min_value=0, max_value=100, format="%d")})
+
+
 def page_stats():
     st.title("📊 Statistiques")
-    df = get_opportunities_for_user(ME)
-    apps = user_applications(ME)
-    offers = list_offers()
-    c = st.columns(4)
-    c[0].metric("Entreprises", len(df))
-    c[1].metric("Score moyen", round(df["score_opportunite"].mean(), 1) if len(df) else 0)
-    c[2].metric("Favoris", int(df["favori"].sum()) if len(df) else 0)
-    c[3].metric("Candidatures", len(apps))
-    if len(df):
-        st.subheader("Entreprises par secteur")
-        st.bar_chart(df["secteur"].value_counts())
-    if not apps.empty:
-        st.subheader("Candidatures par statut")
-        st.bar_chart(apps["statut"].value_counts())
-    if not offers.empty:
-        a, b = st.columns(2)
-        a.subheader("Offres par contrat")
-        a.bar_chart(offers["contrat"].value_counts())
-        b.subheader("Offres par type de stage")
-        b.bar_chart(offers["type_stage"].value_counts())
-    if len(df):
-        has_mail = df["email"].fillna("").str.strip() != ""
-        st.subheader("Présence numérique")
-        st.bar_chart(pd.Series({"Avec e-mail": int(has_mail.sum()), "Sans e-mail": int((~has_mail).sum())}))
-    opps_all = get_opportunities_for_user(ME)
-    st.download_button("⬇️ Export Excel complet",
-                       df_to_xlsx({"Opportunites": opps_all, "Candidatures": apps}),
-                       "resultats_analyse_et_suivi.xlsx")
-
-
-# ---------------------------------------------------------------- Collecte & Import
-def page_collecte():
-    st.title("🗄️ Collecte & Import")
-    st.subheader("Google Places")
-    key = st.text_input("Clé Google Maps (optionnelle si définie dans les secrets)", type="password")
-    c1, c2, c3 = st.columns(3)
-    query = c1.text_input("Requête", "Intelligence Artificielle OR Informatique")
-    location = c2.text_input("Position (lat,lng)", "31.6295,-7.9811")
-    radius = c3.number_input("Rayon (m)", 500, 50000, 10000, 500)
-    if st.button("Lancer la collecte", type="primary"):
-        k = key or GOOGLE_API_KEY
-        if not k:
-            st.error("Aucune clé Google Maps fournie.")
+    df = companies_df()
+    c1, c2 = st.columns(2)
+    with c1.container(border=True):
+        st.subheader("🏢 Entreprises par secteur")
+        if df.empty:
+            st.caption("Pas encore de données.")
         else:
-            with st.spinner("Collecte en cours..."):
-                try:
-                    raw = fetch_it_companies_google(k, location=location, radius=int(radius), query=query)
-                    if not raw:
-                        st.warning("Aucun résultat renvoyé par Google Places.")
-                    else:
-                        n = upsert_opportunities(clean_and_score_places(raw), added_by=ME)
-                        st.success(f"{n} entreprise(s) enregistrée(s)")
-                except Exception as e:
-                    st.error(f"Erreur de collecte : {e}")
+            st.bar_chart(df["sector"].value_counts())
+    with c2.container(border=True):
+        st.subheader("📈 Distribution des scores")
+        if df.empty:
+            st.caption("Pas encore de données.")
+        else:
+            st.bar_chart(pd.cut(df["score"], [-1, 20, 40, 60, 80, 100],
+                                labels=["0-20", "21-40", "41-60", "61-80", "81-100"]).value_counts().sort_index())
+    c3, c4 = st.columns(2)
+    with c3.container(border=True):
+        st.subheader("📋 Offres par type de contrat")
+        offers = pd.DataFrame(q("SELECT contract FROM offers WHERE user_id=?", (UID,)))
+        if offers.empty:
+            st.caption("Pas encore de données.")
+        else:
+            st.bar_chart(offers["contract"].value_counts())
+    with c4.container(border=True):
+        st.subheader("🌐 Présence numérique des entreprises")
+        if df.empty:
+            st.caption("Pas encore de données.")
+        else:
+            has = lambda col: int(df[col].fillna("").ne("").sum())
+            st.bar_chart(pd.Series({"Avec e-mail": has("email"), "Sans e-mail": len(df) - has("email"),
+                                    "Avec site web": has("website"), "Sans site web": len(df) - has("website")}))
+    with st.container(border=True):
+        st.subheader("📨 Candidatures par statut")
+        apps = pd.DataFrame(q("SELECT status FROM applications WHERE user_id=?", (UID,)))
+        if apps.empty:
+            st.caption("Pas encore de données.")
+        else:
+            st.bar_chart(apps["status"].value_counts().reindex(STATUSES).fillna(0))
 
-    st.divider()
-    st.subheader("Import Excel d'entreprises")
-    f = st.file_uploader("Fichier Excel", type=["xlsx", "xls"], key="excel_up")
-    only_it = st.checkbox("Garder seulement IT / IA", True)
-    if f and st.button("Nettoyer et importer"):
-        try:
-            df, report, _ = clean_excel_opportunities(io.BytesIO(f.getvalue()), only_it_ai=only_it)
-            report["opportunites_ajoutees"] = upsert_opportunities(df, added_by=ME)
-            st.success("Import terminé")
-            st.json(report)
-        except Exception as e:
-            st.error(f"Erreur de lecture du fichier Excel : {e}")
+
+COLMAP = {
+    "name": ["name", "nom", "entreprise", "company", "title"],
+    "address": ["address", "adresse"],
+    "phone": ["phone", "telephone", "téléphone", "tel"],
+    "email": ["email", "e-mail", "mail"],
+    "website": ["website", "site", "site web", "url"],
+    "maps": ["maps", "google maps", "maps_url"],
+    "rating": ["rating", "note"],
+    "sector": ["sector", "secteur"],
+    "lat": ["lat", "latitude"],
+    "lng": ["lng", "lon", "longitude"],
+}
+
+
+def import_companies(df):
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    found = {k: next((c for c in v if c in df.columns), None) for k, v in COLMAP.items()}
+    if not found["name"]:
+        return 0, "Colonne « nom » introuvable."
+    n = 0
+    for _, r in df.iterrows():
+        g = lambda k: (None if not found[k] or pd.isna(r[found[k]]) else r[found[k]])
+        if not g("name"):
+            continue
+        sec = g("sector") if g("sector") in SECTORS else "Informatique"
+        ex("INSERT INTO companies(user_id,name,address,sector,phone,email,website,maps,rating,lat,lng) "
+           "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+           (UID, str(g("name")), g("address"), sec, g("phone"), g("email"), g("website"), g("maps"),
+            float(g("rating")) if g("rating") else None, float(g("lat")) if g("lat") else None,
+            float(g("lng")) if g("lng") else None))
+        n += 1
+    return n, None
+
+
+def google_places(api_key, query, max_results=20):
+    r = requests.post(
+        "https://places.googleapis.com/v1/places:searchText",
+        headers={"X-Goog-Api-Key": api_key, "Content-Type": "application/json",
+                 "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.nationalPhoneNumber,"
+                                     "places.websiteUri,places.rating,places.location,places.googleMapsUri"},
+        json={"textQuery": query, "pageSize": max_results}, timeout=30)
+    r.raise_for_status()
+    return r.json().get("places", [])
+
+
+def page_import():
+    st.title("🗄️ Collecte & Import")
+    t1, t2, t3 = st.tabs(["📍 Google Places", "📥 Import Excel/CSV", "⚠️ Données"])
+    with t1:
+        st.caption("Récupère automatiquement des entreprises via l'API Google Places (clé requise).")
+        key = st.text_input("Clé API Google Places", type="password", value=os.getenv("GOOGLE_PLACES_API_KEY", ""))
+        query = st.text_input("Recherche", "entreprise informatique intelligence artificielle Marrakech")
+        sector = st.selectbox("Secteur à attribuer", SECTORS)
+        if st.button("Lancer la collecte", type="primary"):
+            if not key:
+                st.error("Clé API requise.")
+            else:
+                try:
+                    places = google_places(key, query)
+                    existing = {c["name"].lower() for c in q("SELECT name FROM companies WHERE user_id=?", (UID,))}
+                    n = 0
+                    for p in places:
+                        nm = p.get("displayName", {}).get("text", "")
+                        if not nm or nm.lower() in existing:
+                            continue
+                        loc = p.get("location", {})
+                        ex("INSERT INTO companies(user_id,name,address,sector,phone,website,maps,rating,lat,lng) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (UID, nm, p.get("formattedAddress"), sector, p.get("nationalPhoneNumber"),
+                            p.get("websiteUri"), p.get("googleMapsUri"), p.get("rating"),
+                            loc.get("latitude"), loc.get("longitude")))
+                        n += 1
+                    st.success(f"{n} entreprise(s) ajoutée(s).")
+                except Exception as e:
+                    st.error(f"Erreur API : {e}")
+    with t2:
+        st.caption("Colonnes reconnues : nom, adresse, téléphone, email, site, note, secteur, lat, lng.")
+        kind = st.radio("Type de données", ["Entreprises", "Offres"], horizontal=True)
+        f = st.file_uploader("Fichier", type=["csv", "xlsx"])
+        if f is not None:
+            df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+            st.dataframe(df.head(10), use_container_width=True)
+            if st.button("Importer", type="primary"):
+                if kind == "Entreprises":
+                    n, err = import_companies(df)
+                    st.error(err) if err else st.success(f"{n} entreprise(s) importée(s).")
+                else:
+                    df.columns = [str(c).strip().lower() for c in df.columns]
+                    tc = next((c for c in ["title", "titre", "poste"] if c in df.columns), None)
+                    if not tc:
+                        st.error("Colonne « titre » introuvable.")
+                    else:
+                        n = 0
+                        for _, r in df.iterrows():
+                            ex("INSERT INTO offers(user_id,title,company,intern_type,contract,link,created) "
+                               "VALUES(?,?,?,?,?,?,?)",
+                               (UID, str(r[tc]), str(r.get("company", r.get("entreprise", "")) or ""),
+                                INTERN_TYPES[0], "Stage", str(r.get("link", r.get("lien", "")) or ""),
+                                dt.date.today().isoformat()))
+                            n += 1
+                        st.success(f"{n} offre(s) importée(s).")
+    with t3:
+        df = companies_df()
+        if not df.empty:
+            st.download_button("⬇️ Exporter les entreprises (CSV)", df.to_csv(index=False).encode("utf-8"),
+                               "entreprises.csv", "text/csv")
+        if st.button("🗑️ Supprimer toutes mes entreprises"):
+            ex("DELETE FROM companies WHERE user_id=?", (UID,))
+            st.rerun()
 
 
 {
-    "🏠 Accueil": page_accueil, "🏢 Entreprises": page_entreprises, "📄 Offres": page_offres,
-    "🗺️ Carte": page_carte, "📨 Candidatures": page_candidatures, "📎 Mes CV": page_cv,
-    "👤 Profil & Matching": page_profil, "📊 Statistiques": page_stats, "🗄️ Collecte & Import": page_collecte,
-}[page]()
+    "home": page_home, "companies": page_companies, "offers": page_offers, "map": page_map,
+    "apps": page_apps, "cvs": page_cvs, "profile": page_profile, "stats": page_stats, "import": page_import,
+}[PAGES[page]]()
