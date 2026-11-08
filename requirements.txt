@@ -11,3 +11,5 @@ requests
 beautifulsoup4
 pandas
 openpyxl
+streamlit
+
